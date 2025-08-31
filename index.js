@@ -16,9 +16,8 @@ async function askFlowise(question) {
 
   const headers = { 'Content-Type': 'application/json' };
   if (process.env.FLOWISE_API_KEY) {
-    // Common header names used by Flowise deployments
     headers['Authorization'] = `Bearer ${process.env.FLOWISE_API_KEY}`;
-    headers['x-api-key'] = process.env.FLOWISE_API_KEY; // if the instance expects this
+    headers['x-api-key'] = process.env.FLOWISE_API_KEY;
   }
 
   try {
@@ -29,7 +28,6 @@ async function askFlowise(question) {
     );
 
     const d = res.data;
-    // Try a few common shapes
     if (!d) return '[No data from Flowise]';
     if (typeof d === 'string') return d;
     if (d.text) return d.text;
@@ -41,11 +39,9 @@ async function askFlowise(question) {
     if (d.data && (d.data.text || d.data.answer)) {
       return d.data.text || d.data.answer;
     }
-    // Fallback to JSON
     return '`[Unrecognized Flowise response]` ' + '```json\n' + JSON.stringify(d, null, 2) + '\n```';
   } catch (err) {
     console.error('Flowise error:', err.response?.status, err.response?.data || err.message);
-    // User-friendly message with minimal leak
     if (err.response) {
       return `[Flowise error ${err.response.status}]`;
     }
@@ -59,18 +55,35 @@ class FlowiseBot extends ActivityHandler {
     super();
 
     this.onMessage(async (context, next) => {
-      const text = (context.activity && context.activity.text) || '';
+      // Extract plain text and strip @Bot mentions if present
+      let text = (context.activity && context.activity.text) || '';
+      if (context.activity.entities) {
+        for (const entity of context.activity.entities) {
+          if (
+            entity.type === 'mention' &&
+            entity.mentioned &&
+            entity.mentioned.id === context.activity.recipient.id
+          ) {
+            text = text.replace(entity.text, '').trim();
+          }
+        }
+      }
+
       if (!text.trim()) {
         await context.sendActivity('Please send a message.');
         return;
       }
 
-      // Tiny typing hint
       await context.sendActivity({ type: 'typing' });
-
       const answer = await askFlowise(text);
-      await context.sendActivity(answer);
 
+      // In channels, reply in-thread
+      const reply = { type: 'message', text: answer };
+      if (context.activity.conversation.conversationType === 'channel') {
+        reply.id = context.activity.id; // thread it
+      }
+
+      await context.sendActivity(reply);
       await next();
     });
 
@@ -79,7 +92,7 @@ class FlowiseBot extends ActivityHandler {
       for (const member of membersAdded) {
         if (member.id !== context.activity.recipient.id) {
           await context.sendActivity(
-            'Hi! I’m connected to Flowise. Send me a question and I’ll ask the RAG agent.'
+            'Hi! I’m connected to Flowise. Mention me with @BotName in a channel or message me directly to ask questions.'
           );
         }
       }
