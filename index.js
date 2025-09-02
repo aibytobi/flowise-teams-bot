@@ -11,7 +11,9 @@ const {
   createBotFrameworkAuthenticationFromConfiguration,
 } = require('botbuilder');
 
-/** ---- Flowise call helper (tolerant to different payloads) ---- */
+/** ----------------------------------------------------------------
+ * Flowise call helper (unchanged)
+ * ---------------------------------------------------------------*/
 async function askFlowise(question) {
   if (!process.env.FLOWISE_URL) {
     return '[Flowise not configured: set FLOWISE_URL in .env]';
@@ -52,7 +54,9 @@ async function askFlowise(question) {
   }
 }
 
-/** ---------- Helpers: detect audio attachments from Teams ---------- */
+/** ----------------------------------------------------------------
+ * Helpers: detect audio in Teams attachments
+ * ---------------------------------------------------------------*/
 function looksLikeAudioFilename(name = '') {
   const lower = name.toLowerCase();
   return (
@@ -66,17 +70,10 @@ function looksLikeAudioFilename(name = '') {
   );
 }
 
-/**
- * Extracts best-guess audio info from a Teams attachment.
- * Supports:
- * - Teams file download card: contentType 'application/vnd.microsoft.teams.file.download.info'
- *   -> use attachment.content.downloadUrl + attachment.name
- * - Direct audio content types: 'audio/*' with contentUrl
- */
 function extractAudioInfoFromAttachment(att = {}) {
   const ct = (att.contentType || '').toLowerCase();
 
-  // Case 1: Teams File Download Info card
+  // Teams File Download Info card
   if (ct === 'application/vnd.microsoft.teams.file.download.info') {
     const name = att.name || att.content?.name || 'audio';
     const downloadUrl = att.content?.downloadUrl || att.contentUrl;
@@ -92,7 +89,7 @@ function extractAudioInfoFromAttachment(att = {}) {
     }
   }
 
-  // Case 2: Direct audio content types
+  // Direct audio content types
   if (ct.startsWith('audio/')) {
     const name = att.name || `audio.${ct.split('/')[1] || 'wav'}`;
     if (att.contentUrl) {
@@ -106,7 +103,7 @@ function extractAudioInfoFromAttachment(att = {}) {
     }
   }
 
-  // Case 3: Unknown type but filename looks like audio
+  // Fallback: filename looks like audio
   const nameGuess = att.name || att.content?.name || '';
   if (looksLikeAudioFilename(nameGuess) && (att.content?.downloadUrl || att.contentUrl)) {
     return {
@@ -121,7 +118,57 @@ function extractAudioInfoFromAttachment(att = {}) {
   return null;
 }
 
-/** ---- Bot ---- */
+/** ----------------------------------------------------------------
+ * NEW: get Graph token and download protected file to /tmp
+ * ---------------------------------------------------------------*/
+async function getGraphAppToken() {
+  // Uses client credentials to get an app-only token for Microsoft Graph
+  // Azure Portal -> App registration is the same one backing your bot.
+  const tenant = process.env.MICROSOFT_APP_TENANT_ID;
+  const tokenUrl = `https://login.microsoftonline.com/${tenant}/oauth2/v2.0/token`;
+
+  const body = new URLSearchParams({
+    grant_type: 'client_credentials',
+    client_id: process.env.MICROSOFT_APP_ID,
+    client_secret: process.env.MICROSOFT_APP_PASSWORD,
+    scope: 'https://graph.microsoft.com/.default',
+  });
+
+  const resp = await axios.post(tokenUrl, body.toString(), {
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    timeout: 20_000,
+  });
+
+  return resp.data.access_token;
+}
+
+async function downloadTeamsProtectedFile(fileUrl, suggestedName = 'audio.wav') {
+  const accessToken = await getGraphAppToken();
+
+  const resp = await axios.get(fileUrl, {
+    headers: { Authorization: `Bearer ${accessToken}` },
+    responseType: 'arraybuffer',
+    timeout: 60_000,
+    // Some tenants require this header to follow auth redirect chains correctly
+    maxRedirects: 5,
+    validateStatus: (s) => s >= 200 && s < 400, // follow redirects
+  });
+
+  // Ensure filename has an extension
+  let filename = suggestedName || 'audio.wav';
+  if (!path.extname(filename)) filename = `${filename}.wav`;
+
+  // Save under /tmp with a timestamp to avoid collisions
+  const safeName = filename.replace(/[^a-zA-Z0-9._-]/g, '_');
+  const stamped = `${Date.now()}_${safeName}`;
+  const filePath = path.join('/tmp', stamped);
+  fs.writeFileSync(filePath, resp.data);
+  return filePath;
+}
+
+/** ----------------------------------------------------------------
+ * Bot
+ * ---------------------------------------------------------------*/
 class FlowiseBot extends ActivityHandler {
   constructor() {
     super();
@@ -130,7 +177,7 @@ class FlowiseBot extends ActivityHandler {
       const activity = context.activity || {};
       const attachments = activity.attachments || [];
 
-      // 1) First, check if the user sent any audio attachment(s)
+      // Step 2 focus: find audio, then securely download it
       const audioItems = [];
       for (const att of attachments) {
         const info = extractAudioInfoFromAttachment(att);
@@ -138,25 +185,30 @@ class FlowiseBot extends ActivityHandler {
       }
 
       if (audioItems.length > 0) {
-        // For Step 1, we ONLY acknowledge and log the details (no download/transcribe yet)
-        for (const a of audioItems) {
-          console.log('🎤 Audio attachment detected:', a);
+        // For now: download the FIRST audio file and report where it was saved.
+        const audio = audioItems[0];
+        console.log('🎤 Audio attachment detected:', audio);
+
+        try {
+          await context.sendActivity({ type: 'typing' });
+          const savedPath = await downloadTeamsProtectedFile(audio.url, audio.name);
+          console.log('✅ Audio saved to:', savedPath);
+
+          await context.sendActivity(
+            `📥 Downloaded **${audio.name}** (${audio.fileType}) and saved to:\n\`${savedPath}\`\n\n(Next step: Azure STT transcription.)`
+          );
+        } catch (err) {
+          console.error('Download error:', err.response?.data || err.message);
+          await context.sendActivity(
+            `⚠️ I detected your audio **${audio.name}**, but downloading it failed. Please try again.`
+          );
         }
-
-        const list = audioItems
-          .map((a, i) => `• ${a.name} (${a.fileType}) via ${a.source}`)
-          .join('\n');
-
-        await context.sendActivity(
-          `🎧 I received your audio file:\n${list}\n\n(Transcription comes next step.)`
-        );
 
         await next();
         return;
       }
 
-      // 2) Otherwise, fall back to normal text handling (Flowise)
-      // Extract plain text and strip @Bot mentions if present
+      // Normal text flow (Flowise)
       let text = (activity && activity.text) || '';
       if (activity.entities) {
         for (const entity of activity.entities) {
@@ -178,10 +230,9 @@ class FlowiseBot extends ActivityHandler {
       await context.sendActivity({ type: 'typing' });
       const answer = await askFlowise(text);
 
-      // In channels, reply in-thread
       const reply = { type: 'message', text: answer };
       if (activity.conversation?.conversationType === 'channel') {
-        reply.id = activity.id; // thread it
+        reply.id = activity.id;
       }
 
       await context.sendActivity(reply);
@@ -202,7 +253,7 @@ class FlowiseBot extends ActivityHandler {
   }
 }
 
-/** Auth + adapter as before */
+/** Auth + adapter */
 const credentialsFactory = new ConfigurationServiceClientCredentialFactory({
   MicrosoftAppId: process.env.MICROSOFT_APP_ID,
   MicrosoftAppPassword: process.env.MICROSOFT_APP_PASSWORD,
