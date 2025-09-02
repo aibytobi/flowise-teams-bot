@@ -1,6 +1,9 @@
 require('dotenv').config();
 const restify = require('restify');
 const axios = require('axios');
+const path = require('path');
+const fs = require('fs');
+
 const {
   ActivityHandler,
   CloudAdapter,
@@ -49,20 +52,118 @@ async function askFlowise(question) {
   }
 }
 
+/** ---------- Helpers: detect audio attachments from Teams ---------- */
+function looksLikeAudioFilename(name = '') {
+  const lower = name.toLowerCase();
+  return (
+    lower.endsWith('.wav') ||
+    lower.endsWith('.mp3') ||
+    lower.endsWith('.m4a') ||
+    lower.endsWith('.ogg') ||
+    lower.endsWith('.webm') ||
+    lower.endsWith('.aac') ||
+    lower.endsWith('.flac')
+  );
+}
+
+/**
+ * Extracts best-guess audio info from a Teams attachment.
+ * Supports:
+ * - Teams file download card: contentType 'application/vnd.microsoft.teams.file.download.info'
+ *   -> use attachment.content.downloadUrl + attachment.name
+ * - Direct audio content types: 'audio/*' with contentUrl
+ */
+function extractAudioInfoFromAttachment(att = {}) {
+  const ct = (att.contentType || '').toLowerCase();
+
+  // Case 1: Teams File Download Info card
+  if (ct === 'application/vnd.microsoft.teams.file.download.info') {
+    const name = att.name || att.content?.name || 'audio';
+    const downloadUrl = att.content?.downloadUrl || att.contentUrl;
+    const fileType = att.content?.fileType || path.extname(name).replace('.', '');
+    if (downloadUrl && looksLikeAudioFilename(name)) {
+      return {
+        source: 'teams-file-download-info',
+        name,
+        fileType,
+        contentType: ct,
+        url: downloadUrl,
+      };
+    }
+  }
+
+  // Case 2: Direct audio content types
+  if (ct.startsWith('audio/')) {
+    const name = att.name || `audio.${ct.split('/')[1] || 'wav'}`;
+    if (att.contentUrl) {
+      return {
+        source: 'direct-audio',
+        name,
+        fileType: ct.split('/')[1] || 'wav',
+        contentType: ct,
+        url: att.contentUrl,
+      };
+    }
+  }
+
+  // Case 3: Unknown type but filename looks like audio
+  const nameGuess = att.name || att.content?.name || '';
+  if (looksLikeAudioFilename(nameGuess) && (att.content?.downloadUrl || att.contentUrl)) {
+    return {
+      source: 'filename-audio-fallback',
+      name: nameGuess,
+      fileType: path.extname(nameGuess).replace('.', '') || 'wav',
+      contentType: ct || 'unknown',
+      url: att.content?.downloadUrl || att.contentUrl,
+    };
+  }
+
+  return null;
+}
+
 /** ---- Bot ---- */
 class FlowiseBot extends ActivityHandler {
   constructor() {
     super();
 
     this.onMessage(async (context, next) => {
+      const activity = context.activity || {};
+      const attachments = activity.attachments || [];
+
+      // 1) First, check if the user sent any audio attachment(s)
+      const audioItems = [];
+      for (const att of attachments) {
+        const info = extractAudioInfoFromAttachment(att);
+        if (info) audioItems.push(info);
+      }
+
+      if (audioItems.length > 0) {
+        // For Step 1, we ONLY acknowledge and log the details (no download/transcribe yet)
+        for (const a of audioItems) {
+          console.log('🎤 Audio attachment detected:', a);
+        }
+
+        const list = audioItems
+          .map((a, i) => `• ${a.name} (${a.fileType}) via ${a.source}`)
+          .join('\n');
+
+        await context.sendActivity(
+          `🎧 I received your audio file:\n${list}\n\n(Transcription comes next step.)`
+        );
+
+        await next();
+        return;
+      }
+
+      // 2) Otherwise, fall back to normal text handling (Flowise)
       // Extract plain text and strip @Bot mentions if present
-      let text = (context.activity && context.activity.text) || '';
-      if (context.activity.entities) {
-        for (const entity of context.activity.entities) {
+      let text = (activity && activity.text) || '';
+      if (activity.entities) {
+        for (const entity of activity.entities) {
           if (
             entity.type === 'mention' &&
             entity.mentioned &&
-            entity.mentioned.id === context.activity.recipient.id
+            entity.mentioned.id === activity.recipient.id
           ) {
             text = text.replace(entity.text, '').trim();
           }
@@ -79,8 +180,8 @@ class FlowiseBot extends ActivityHandler {
 
       // In channels, reply in-thread
       const reply = { type: 'message', text: answer };
-      if (context.activity.conversation.conversationType === 'channel') {
-        reply.id = context.activity.id; // thread it
+      if (activity.conversation?.conversationType === 'channel') {
+        reply.id = activity.id; // thread it
       }
 
       await context.sendActivity(reply);
