@@ -3,6 +3,9 @@ const restify = require('restify');
 const axios = require('axios');
 const path = require('path');
 const fs = require('fs');
+const { spawn } = require('child_process');
+const ffmpegPath = require('ffmpeg-static');
+const sdk = require('microsoft-cognitiveservices-speech-sdk');
 
 const {
   ActivityHandler,
@@ -119,11 +122,9 @@ function extractAudioInfoFromAttachment(att = {}) {
 }
 
 /** ----------------------------------------------------------------
- * NEW: get Graph token and download protected file to /tmp
+ * Graph token + file download
  * ---------------------------------------------------------------*/
 async function getGraphAppToken() {
-  // Uses client credentials to get an app-only token for Microsoft Graph
-  // Azure Portal -> App registration is the same one backing your bot.
   const tenant = process.env.MICROSOFT_APP_TENANT_ID;
   const tokenUrl = `https://login.microsoftonline.com/${tenant}/oauth2/v2.0/token`;
 
@@ -149,16 +150,13 @@ async function downloadTeamsProtectedFile(fileUrl, suggestedName = 'audio.wav') 
     headers: { Authorization: `Bearer ${accessToken}` },
     responseType: 'arraybuffer',
     timeout: 60_000,
-    // Some tenants require this header to follow auth redirect chains correctly
     maxRedirects: 5,
-    validateStatus: (s) => s >= 200 && s < 400, // follow redirects
+    validateStatus: (s) => s >= 200 && s < 400,
   });
 
-  // Ensure filename has an extension
   let filename = suggestedName || 'audio.wav';
   if (!path.extname(filename)) filename = `${filename}.wav`;
 
-  // Save under /tmp with a timestamp to avoid collisions
   const safeName = filename.replace(/[^a-zA-Z0-9._-]/g, '_');
   const stamped = `${Date.now()}_${safeName}`;
   const filePath = path.join('/tmp', stamped);
@@ -167,7 +165,64 @@ async function downloadTeamsProtectedFile(fileUrl, suggestedName = 'audio.wav') 
 }
 
 /** ----------------------------------------------------------------
- * Bot
+ * Azure STT (handles m4a/mp3 via ffmpeg → 16k PCM stream)
+ * ---------------------------------------------------------------*/
+function speechConfig() {
+  const cfg = sdk.SpeechConfig.fromSubscription(
+    process.env.AZURE_SPEECH_KEY,
+    process.env.AZURE_SPEECH_REGION
+  );
+  cfg.speechRecognitionLanguage = process.env.SPEECH_LANG || 'en-US';
+  // Optional: tune end-of-speech; default works fine for short notes
+  return cfg;
+}
+
+/**
+ * Transcribe any audio file by transcoding it with ffmpeg to 16kHz PCM
+ * and streaming into Azure Speech SDK.
+ */
+async function transcribeWithAzure(filePath) {
+  return new Promise((resolve, reject) => {
+    const pushStream = sdk.AudioInputStream.createPushStream();
+
+    // ffmpeg -> raw s16le 16k mono
+    const ff = spawn(ffmpegPath, [
+      '-hide_banner',
+      '-loglevel', 'error',
+      '-i', filePath,
+      '-vn',
+      '-acodec', 'pcm_s16le',
+      '-ac', '1',
+      '-ar', '16000',
+      '-f', 's16le',
+      'pipe:1',
+    ]);
+
+    ff.stdout.on('data', (chunk) => pushStream.write(chunk));
+    ff.stderr.on('data', (d) => {
+      // You can log ffmpeg warnings if needed
+    });
+    ff.on('close', () => pushStream.close());
+    ff.on('error', (e) => reject(new Error('ffmpeg failed: ' + e.message)));
+
+    const audioConfig = sdk.AudioConfig.fromStreamInput(pushStream);
+    const recognizer = new sdk.SpeechRecognizer(speechConfig(), audioConfig);
+
+    recognizer.recognizeOnceAsync(
+      (result) => {
+        recognizer.close();
+        resolve(result.text || '');
+      },
+      (err) => {
+        recognizer.close();
+        reject(err);
+      }
+    );
+  });
+}
+
+/** ----------------------------------------------------------------
+ * Bot: now downloads → transcribes → (optionally) asks Flowise
  * ---------------------------------------------------------------*/
 class FlowiseBot extends ActivityHandler {
   constructor() {
@@ -177,7 +232,7 @@ class FlowiseBot extends ActivityHandler {
       const activity = context.activity || {};
       const attachments = activity.attachments || [];
 
-      // Step 2 focus: find audio, then securely download it
+      // Audio path
       const audioItems = [];
       for (const att of attachments) {
         const info = extractAudioInfoFromAttachment(att);
@@ -185,22 +240,32 @@ class FlowiseBot extends ActivityHandler {
       }
 
       if (audioItems.length > 0) {
-        // For now: download the FIRST audio file and report where it was saved.
         const audio = audioItems[0];
         console.log('🎤 Audio attachment detected:', audio);
 
         try {
           await context.sendActivity({ type: 'typing' });
+
+          // 1) Download
           const savedPath = await downloadTeamsProtectedFile(audio.url, audio.name);
-          console.log('✅ Audio saved to:', savedPath);
+          console.log('✅ Saved audio to:', savedPath);
+
+          // 2) Transcribe with Azure
+          const transcript = await transcribeWithAzure(savedPath);
+          console.log('📝 Transcript:', transcript);
+
+          // 3) Ask Flowise with the transcript
+          const flowiseAnswer = transcript
+            ? await askFlowise(transcript)
+            : '[No speech detected]';
 
           await context.sendActivity(
-            `📥 Downloaded **${audio.name}** (${audio.fileType}) and saved to:\n\`${savedPath}\`\n\n(Next step: Azure STT transcription.)`
+            `📝 **Transcript:** ${transcript || '_<empty>_'}\n\n—\n**Answer:** ${flowiseAnswer}`
           );
         } catch (err) {
-          console.error('Download error:', err.response?.data || err.message);
+          console.error('Transcription flow error:', err?.response?.data || err?.message || err);
           await context.sendActivity(
-            `⚠️ I detected your audio **${audio.name}**, but downloading it failed. Please try again.`
+            `⚠️ I detected your audio **${audio.name}**, but I couldn't transcribe it. Please try a different clip or format.`
           );
         }
 
@@ -208,7 +273,7 @@ class FlowiseBot extends ActivityHandler {
         return;
       }
 
-      // Normal text flow (Flowise)
+      // Text path (unchanged)
       let text = (activity && activity.text) || '';
       if (activity.entities) {
         for (const entity of activity.entities) {
